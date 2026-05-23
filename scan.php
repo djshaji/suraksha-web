@@ -266,6 +266,12 @@ include 'lib/header.php';
           <span id="submitEntryWrap" class="d-inline-block" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Scan barcode and load token first.">
             <button id="submitEntryBtn" class="btn btn-primary" disabled>Record Entry</button>
           </span>
+          <select id="scannerApiSelect" class="form-select" style="max-width: 220px;">
+            <option value="auto" selected>Scanner API: Auto</option>
+            <option value="native">Scanner API: Native</option>
+            <option value="zxing">Scanner API: ZXing</option>
+            <option value="quagga">Scanner API: Quagga2 (1D)</option>
+          </select>
           <button id="sessionTokenBtn" class="btn btn-outline-primary">Use Session Login</button>
           <div class="form-check form-switch d-inline-flex align-items-center ms-md-1">
             <input class="form-check-input" type="checkbox" id="autoRecordToggle" checked>
@@ -328,6 +334,7 @@ include 'lib/header.php';
   const stopBtn = document.getElementById('stopScanBtn');
   const submitBtn = document.getElementById('submitEntryBtn');
   const submitEntryWrap = document.getElementById('submitEntryWrap');
+  const scannerApiSelect = document.getElementById('scannerApiSelect');
   const sessionTokenBtn = document.getElementById('sessionTokenBtn');
   const statusBox = document.getElementById('scanStatus');
   const scanFrame = document.getElementById('scanFrame');
@@ -340,6 +347,8 @@ include 'lib/header.php';
   const tokenRequiredHint = document.getElementById('tokenRequiredHint');
   const autoRecordToggle = document.getElementById('autoRecordToggle');
   const webcamAssistToggle = document.getElementById('webcamAssistToggle');
+  const successAudio = new Audio('/assets/prompt.wav');
+  successAudio.preload = 'auto';
 
   const userIdEl = document.getElementById('scanUserId');
   const studentNameEl = document.getElementById('scanStudentName');
@@ -351,6 +360,11 @@ include 'lib/header.php';
   let zxingModule = null;
   let zxingReader = null;
   let zxingControls = null;
+  let quaggaModule = null;
+  let quaggaScanInterval = null;
+  let quaggaDecodeBusy = false;
+  let quaggaCanvas = null;
+  let quaggaContext = null;
   let scannerMode = 'native';
   let rafId = null;
   let nativeFallbackTimer = null;
@@ -364,6 +378,7 @@ include 'lib/header.php';
   let lastQualityCheckAt = 0;
   let blurPauseActive = false;
   let lastBlurStatusAt = 0;
+  let successOverlayActive = false;
 
   const scanData = {
     userId: '',
@@ -382,6 +397,20 @@ include 'lib/header.php';
     }
 
     scanFrame.classList.toggle('assist-mode', isWebcamAssistEnabled());
+  }
+
+  function isProbablyMobileDevice() {
+    const coarsePointer = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+    const narrowViewport = window.matchMedia && window.matchMedia('(max-width: 900px)').matches;
+    return Boolean(coarsePointer || narrowViewport);
+  }
+
+  function applyDefaultScannerApi() {
+    if (!scannerApiSelect) {
+      return;
+    }
+
+    scannerApiSelect.value = isProbablyMobileDevice() ? 'auto' : 'quagga';
   }
 
   function ensureAnalysisCanvas() {
@@ -584,6 +613,10 @@ include 'lib/header.php';
   }
 
   function processDecodedRaw(rawValue) {
+    if (successOverlayActive) {
+      return;
+    }
+
     const value = (rawValue || '').trim();
     if (!value) {
       return;
@@ -615,6 +648,27 @@ include 'lib/header.php';
 
     zxingModule = await import('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/+esm');
     return zxingModule;
+  }
+
+  async function getQuaggaModule() {
+    if (quaggaModule) {
+      return quaggaModule;
+    }
+
+    const mod = await import('https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.2/+esm');
+    quaggaModule = mod.default || mod;
+    return quaggaModule;
+  }
+
+  function ensureQuaggaCanvas() {
+    if (quaggaCanvas && quaggaContext) {
+      return;
+    }
+
+    quaggaCanvas = document.createElement('canvas');
+    quaggaCanvas.width = 960;
+    quaggaCanvas.height = 540;
+    quaggaContext = quaggaCanvas.getContext('2d');
   }
 
   function clearNativeFallbackTimer() {
@@ -673,6 +727,86 @@ include 'lib/header.php';
     startBtn.disabled = true;
     stopBtn.disabled = false;
     setStatus('Camera started. Using ZXing fallback scanner. For fixed-focus webcams, hold code 20-35 cm away and fill most of the frame.');
+  }
+
+  async function decodeFrameWithQuagga() {
+    if (!video || video.readyState < 2 || quaggaDecodeBusy) {
+      return;
+    }
+
+    if (shouldPauseDecodeForBlur()) {
+      return;
+    }
+
+    ensureQuaggaCanvas();
+    if (!quaggaContext || !quaggaCanvas) {
+      return;
+    }
+
+    quaggaDecodeBusy = true;
+
+    try {
+      const sourceWidth = video.videoWidth || 1280;
+      const sourceHeight = video.videoHeight || 720;
+      quaggaCanvas.width = sourceWidth;
+      quaggaCanvas.height = sourceHeight;
+      quaggaContext.drawImage(video, 0, 0, sourceWidth, sourceHeight);
+
+      const frameDataUrl = quaggaCanvas.toDataURL('image/jpeg', 0.9);
+      const Quagga = await getQuaggaModule();
+
+      await new Promise((resolve) => {
+        Quagga.decodeSingle({
+          src: frameDataUrl,
+          numOfWorkers: 0,
+          locate: true,
+          inputStream: {
+            size: 960,
+            singleChannel: false
+          },
+          decoder: {
+            readers: [
+              'code_128_reader',
+              'code_39_reader',
+              'ean_reader',
+              'upc_reader'
+            ]
+          }
+        }, (result) => {
+          if (result && result.codeResult && result.codeResult.code) {
+            processDecodedRaw(String(result.codeResult.code));
+          }
+          resolve();
+        });
+      });
+    } catch (err) {
+      // Ignore intermittent frame decode failures.
+    } finally {
+      quaggaDecodeBusy = false;
+    }
+  }
+
+  async function startQuaggaScanner() {
+    scannerMode = 'quagga';
+    setStatus('Starting Quagga2 scanner...');
+
+    mediaStream = await openPreferredCameraStream();
+    video.srcObject = mediaStream;
+    await video.play();
+
+    if (quaggaScanInterval) {
+      clearInterval(quaggaScanInterval);
+      quaggaScanInterval = null;
+    }
+
+    quaggaScanInterval = setInterval(() => {
+      void decodeFrameWithQuagga();
+    }, 220);
+
+    scanning = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    setStatus('Camera started. Using Quagga2 (1D barcodes). For fixed-focus webcams, hold code steady and centered.');
   }
 
   async function switchToZxingFallback() {
@@ -741,13 +875,27 @@ include 'lib/header.php';
   }
 
   function showSuccessAnimation() {
+    try {
+      successAudio.currentTime = 0;
+      const playPromise = successAudio.play();
+      if (playPromise && typeof playPromise.catch === 'function') {
+        playPromise.catch(() => {
+          // Ignore playback failures caused by browser autoplay policies.
+        });
+      }
+    } catch (err) {
+      // Ignore audio errors to avoid breaking scan flow.
+    }
+
     if (checkmarkRoll) {
       checkmarkRoll.textContent = scanData.userId ? `Roll: ${scanData.userId}` : '';
     }
 
+    successOverlayActive = true;
     checkmarkLayer.classList.add('active');
     setTimeout(() => {
       checkmarkLayer.classList.remove('active');
+      successOverlayActive = false;
       if (checkmarkRoll) {
         checkmarkRoll.textContent = '';
       }
@@ -778,6 +926,10 @@ include 'lib/header.php';
   }
 
   async function startCamera() {
+    if (scanning) {
+      return;
+    }
+
     if (!window.isSecureContext) {
       setStatus('Camera requires secure context. Open over HTTPS or localhost.', true);
       return;
@@ -786,6 +938,23 @@ include 'lib/header.php';
     try {
       setStatus('Requesting camera permission...');
       await requestCameraPermission();
+
+      const selectedApi = scannerApiSelect ? scannerApiSelect.value : 'auto';
+
+      if (selectedApi === 'zxing') {
+        await startZxingScanner();
+        return;
+      }
+
+      if (selectedApi === 'quagga') {
+        await startQuaggaScanner();
+        return;
+      }
+
+      if (selectedApi === 'native' && !('BarcodeDetector' in window)) {
+        setStatus('Native BarcodeDetector is unavailable in this browser. Choose ZXing, Quagga2, or Auto.', true);
+        return;
+      }
 
       if ('BarcodeDetector' in window) {
         scannerMode = 'native';
@@ -804,21 +973,36 @@ include 'lib/header.php';
         setStatus('Camera started. Using native BarcodeDetector. For fixed-focus webcams, hold code 20-35 cm away and fill most of the frame.');
         scanLoop();
 
-        clearNativeFallbackTimer();
-        nativeFallbackTimer = setTimeout(() => {
-          if (!scanning || scannerMode !== 'native') {
-            return;
-          }
+        if (selectedApi === 'auto') {
+          clearNativeFallbackTimer();
+          nativeFallbackTimer = setTimeout(() => {
+            if (!scanning || scannerMode !== 'native') {
+              return;
+            }
 
-          setStatus('Native scanner could not decode barcode. Switching to ZXing fallback...');
-          void switchToZxingFallback();
-        }, 5000);
+            setStatus('Native scanner could not decode barcode. Switching to ZXing fallback...');
+            void switchToZxingFallback();
+          }, 5000);
+        }
         return;
       }
 
-      await startZxingScanner();
+      if (selectedApi === 'auto') {
+        await startZxingScanner();
+        return;
+      }
+
+      setStatus('Selected scanner API is unavailable. Choose ZXing, Quagga2, or Auto.', true);
     } catch (err) {
       setStatus('Unable to access camera/scanner. Check permission, HTTPS, and network for fallback library.', true);
+    }
+  }
+
+  async function autoStartCameraOnLoad() {
+    try {
+      await startCamera();
+    } catch (err) {
+      setStatus('Auto-start blocked by browser. Click Start Camera to continue.', true);
     }
   }
 
@@ -839,6 +1023,12 @@ include 'lib/header.php';
     if (zxingReader && typeof zxingReader.reset === 'function') {
       zxingReader.reset();
     }
+
+    if (quaggaScanInterval) {
+      clearInterval(quaggaScanInterval);
+      quaggaScanInterval = null;
+    }
+    quaggaDecodeBusy = false;
 
     if (mediaStream) {
       mediaStream.getTracks().forEach((track) => track.stop());
@@ -1006,11 +1196,27 @@ include 'lib/header.php';
     });
   }
 
+  if (scannerApiSelect) {
+    scannerApiSelect.addEventListener('change', () => {
+      const value = scannerApiSelect.value;
+      if (value === 'quagga') {
+        setStatus('Quagga2 selected. Best for 1D barcodes like Code128/Code39/EAN/UPC.');
+      } else if (value === 'zxing') {
+        setStatus('ZXing selected. Good for QR and 1D barcodes.');
+      } else if (value === 'native') {
+        setStatus('Native BarcodeDetector selected. Requires browser support.');
+      } else {
+        setStatus('Auto selected. Native first, then ZXing fallback if needed.');
+      }
+    });
+  }
+
   window.addEventListener('beforeunload', () => {
     stopCamera();
   });
 
   updatePreview();
+  applyDefaultScannerApi();
   updateAssistFrameStyle();
   setTokenState('ok', 'Token state: optional', 'Session login auth is used automatically on this page.');
   updateSubmitAvailability();
@@ -1018,6 +1224,10 @@ include 'lib/header.php';
   if (window.bootstrap && window.bootstrap.Tooltip && submitEntryWrap) {
     window.bootstrap.Tooltip.getOrCreateInstance(submitEntryWrap);
   }
+
+  setTimeout(() => {
+    void autoStartCameraOnLoad();
+  }, 120);
 
 })();
 </script>
