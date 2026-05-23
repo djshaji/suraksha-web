@@ -4,6 +4,45 @@ $description = "Security Application for Govt. SPMR College";
 $LOGIN_URI = $_SERVER['REQUEST_URI'];
 include 'lib/header.php';
 
+if (!isset($_SESSION['auth']) || !is_array($_SESSION['auth'])) {
+  header('Location: /');
+  exit;
+}
+
+require_once 'lib/logger.php';
+require_once 'lib/db.php';
+
+$sessionAuth = $_SESSION['auth'];
+$googleSub = trim((string) ($sessionAuth['sub'] ?? ''));
+$email = trim((string) ($sessionAuth['email'] ?? ''));
+
+if ($googleSub === '' || $email === '') {
+  header('Location: /');
+  exit;
+}
+
+try {
+  $authPdo = DB::conn();
+  $authStmt = $authPdo->prepare(
+    'SELECT id FROM guards WHERE status = :status AND (google_sub_id = :google_sub_id OR email = :email) LIMIT 1'
+  );
+  $authStmt->execute([
+    ':status' => 'active',
+    ':google_sub_id' => $googleSub,
+    ':email' => $email,
+  ]);
+
+  $authorizedGuard = $authStmt->fetch();
+  if (!is_array($authorizedGuard) || !isset($authorizedGuard['id'])) {
+    header('Location: /');
+    exit;
+  }
+} catch (Throwable $e) {
+  logException($e, uniqid('dashboard-auth-', true), ['page' => 'dashboard']);
+  header('Location: /');
+  exit;
+}
+
 $attendance = [
   'total' => 0,
   'in_time' => 0,
@@ -13,30 +52,41 @@ $attendance = [
 
 $weeklyTrend = [0, 0, 0, 0, 0, 0, 0];
 $todaysVisitors = [];
+$todaysVisitorCount = 0;
 $alerts = [];
 
 try {
-  require_once 'lib/db.php';
   $pdo = DB::conn();
 
   $today = date('Y-m-d');
   $onTimeCutoff = '10:00:00';
 
+  $todayVisitorCountStmt = $pdo->prepare('SELECT COUNT(*) AS c FROM visitor_logs WHERE log_date = :today');
+  $todayVisitorCountStmt->execute([':today' => $today]);
+  $todaysVisitorCount = (int) $todayVisitorCountStmt->fetch()['c'];
+
   $activeGuardsStmt = $pdo->query("SELECT COUNT(*) AS c FROM guards WHERE status = 'active'");
   $activeGuards = (int) $activeGuardsStmt->fetch()['c'];
 
-  $markedStmt = $pdo->prepare('SELECT COUNT(DISTINCT guard_id) AS c FROM visitor_logs WHERE log_date = :today');
-  $markedStmt->execute([':today' => $today]);
-  $totalMarked = (int) $markedStmt->fetch()['c'];
-
-  $inTimeStmt = $pdo->prepare(
-    'SELECT COUNT(DISTINCT guard_id) AS c FROM visitor_logs WHERE log_date = :today AND log_time <= :cutoff'
+  $firstScanStmt = $pdo->prepare(
+    'SELECT '
+    . 'COUNT(*) AS total_marked, '
+    . 'SUM(CASE WHEN first_log_time <= :cutoff THEN 1 ELSE 0 END) AS in_time '
+    . 'FROM ('
+    . 'SELECT guard_id, MIN(log_time) AS first_log_time '
+    . 'FROM visitor_logs '
+    . 'WHERE log_date = :today '
+    . 'GROUP BY guard_id'
+    . ') AS first_scans'
   );
-  $inTimeStmt->execute([
+  $firstScanStmt->execute([
     ':today' => $today,
     ':cutoff' => $onTimeCutoff,
   ]);
-  $inTime = (int) $inTimeStmt->fetch()['c'];
+  $firstScanCounts = $firstScanStmt->fetch();
+
+  $totalMarked = isset($firstScanCounts['total_marked']) ? (int) $firstScanCounts['total_marked'] : 0;
+  $inTime = isset($firstScanCounts['in_time']) ? (int) $firstScanCounts['in_time'] : 0;
 
   $attendance['total'] = $totalMarked;
   $attendance['in_time'] = $inTime;
@@ -77,13 +127,13 @@ try {
   if ($attendance['absent'] > 5) {
     $alerts[] = [
       'level' => 'High',
-      'message' => $attendance['absent'] . ' active guards are not marked today.',
+      'message' => $attendance['absent'] . ' active guards show no gate activity today.',
     ];
   }
   if ($attendance['late'] > 0) {
     $alerts[] = [
       'level' => 'Medium',
-      'message' => $attendance['late'] . ' guards reported after ' . $onTimeCutoff . '.',
+      'message' => $attendance['late'] . ' guards started activity after ' . $onTimeCutoff . '.',
     ];
   }
   if (count($todaysVisitors) > 0) {
@@ -93,6 +143,7 @@ try {
     ];
   }
 } catch (Throwable $e) {
+  logException($e, uniqid('dashboard-', true), ['page' => 'dashboard']);
   $alerts[] = [
     'level' => 'Info',
     'message' => 'Live dashboard data unavailable. Showing empty state until database is configured.',
@@ -220,7 +271,7 @@ $polylinePoints = implode(' ', $points);
       <div>
         <span class="dashboard-pill mb-3">Security Operations Dashboard</span>
         <h2 class="h3 fw-bold mb-2">Live Campus Monitoring</h2>
-        <p class="mb-0 text-secondary">Today, <?php echo htmlspecialchars(date('d M Y'), ENT_QUOTES); ?>. Attendance and visitor events refresh from gate logs.</p>
+        <p class="mb-0 text-secondary">Today, <?php echo htmlspecialchars(date('d M Y'), ENT_QUOTES); ?>. Guard activity and visitor events refresh from gate logs.</p>
       </div>
       <div class="text-md-end">
         <div class="small text-uppercase fw-semibold text-secondary">Shift Window</div>
@@ -232,25 +283,25 @@ $polylinePoints = implode(' ', $points);
   <section class="row g-3 mb-4">
     <div class="col-6 col-lg-3">
       <article class="stat-card p-3 p-md-4 h-100">
-        <div class="text-secondary small text-uppercase fw-semibold">Total Marked</div>
-        <div class="stat-number mt-2"><?php echo (int) $attendance['total']; ?></div>
+        <div class="text-secondary small text-uppercase fw-semibold">Today's Visitors</div>
+        <div class="stat-number mt-2"><?php echo (int) $todaysVisitorCount; ?></div>
       </article>
     </div>
     <div class="col-6 col-lg-3">
       <article class="stat-card p-3 p-md-4 h-100">
-        <div class="text-secondary small text-uppercase fw-semibold">In Time</div>
+        <div class="text-secondary small text-uppercase fw-semibold">First Scan In Time</div>
         <div class="stat-number mt-2 text-success"><?php echo (int) $attendance['in_time']; ?></div>
       </article>
     </div>
     <div class="col-6 col-lg-3">
       <article class="stat-card p-3 p-md-4 h-100">
-        <div class="text-secondary small text-uppercase fw-semibold">Late</div>
+        <div class="text-secondary small text-uppercase fw-semibold">First Scan Late</div>
         <div class="stat-number mt-2" style="color:#8a5a00;"><?php echo (int) $attendance['late']; ?></div>
       </article>
     </div>
     <div class="col-6 col-lg-3">
       <article class="stat-card p-3 p-md-4 h-100">
-        <div class="text-secondary small text-uppercase fw-semibold">Absent</div>
+        <div class="text-secondary small text-uppercase fw-semibold">No Activity</div>
         <div class="stat-number mt-2 text-danger"><?php echo (int) $attendance['absent']; ?></div>
       </article>
     </div>
@@ -260,7 +311,7 @@ $polylinePoints = implode(' ', $points);
     <div class="col-lg-8">
       <article class="section-card p-3 p-md-4 h-100">
         <div class="d-flex justify-content-between align-items-center mb-3">
-          <h3 class="h5 mb-0">Weekly Attendance Trend</h3>
+          <h3 class="h5 mb-0">Weekly Guard Activity Trend</h3>
           <span class="small text-secondary">Last 7 days</span>
         </div>
         <svg viewBox="0 0 420 210" class="w-100" role="img" aria-label="Weekly attendance line chart">

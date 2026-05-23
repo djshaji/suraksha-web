@@ -11,10 +11,59 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     methodNotAllowed('POST');
 }
 
+function guardIdFromSession(): ?int
+{
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        session_start();
+    }
+
+    $auth = $_SESSION['auth'] ?? null;
+    if (!is_array($auth)) {
+        return null;
+    }
+
+    $googleSub = trim((string) ($auth['sub'] ?? ''));
+    $email = trim((string) ($auth['email'] ?? ''));
+    if ($googleSub === '' || $email === '') {
+        return null;
+    }
+
+    $pdo = DB::conn();
+    $stmt = $pdo->prepare(
+        'SELECT id FROM guards WHERE status = :status AND (google_sub_id = :google_sub_id OR email = :email) LIMIT 1'
+    );
+    $stmt->execute([
+        ':status' => 'active',
+        ':google_sub_id' => $googleSub,
+        ':email' => $email,
+    ]);
+
+    $guard = $stmt->fetch();
+    if (!is_array($guard) || !isset($guard['id'])) {
+        return null;
+    }
+
+    return (int) $guard['id'];
+}
+
+function resolveGuardId(): int
+{
+    try {
+        $jwt = bearerTokenFromRequest();
+        $claims = verifyAccessToken($jwt);
+        return (int) $claims['guard_id'];
+    } catch (Throwable $e) {
+        $guardId = guardIdFromSession();
+        if ($guardId !== null && $guardId > 0) {
+            return $guardId;
+        }
+
+        unauthorized('AUTH_UNAUTHORIZED', 'Bearer token or active session login required');
+    }
+}
+
 try {
-    $jwt = bearerTokenFromRequest();
-    $claims = verifyAccessToken($jwt);
-    $guardId = (int) $claims['guard_id'];
+    $guardId = resolveGuardId();
 
     $input = readJsonBody();
     $userId = trim((string) ($input['userId'] ?? ''));
@@ -55,8 +104,6 @@ try {
     ]);
 } catch (InvalidArgumentException $e) {
     badRequest('REQUEST_INVALID', $e->getMessage());
-} catch (RuntimeException $e) {
-    unauthorized('AUTH_INVALID_ACCESS_TOKEN', 'Invalid or expired token');
 } catch (Throwable $e) {
     logException($e, requestId(), ['endpoint' => 'record_entry']);
     serverError();

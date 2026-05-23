@@ -1,7 +1,7 @@
 <?php
 $title = "SPMR Suraksha";
 $description = "Security Application for Govt. SPMR College";
-
+$LOGIN_URI = $_SERVER['REQUEST_URI'] ?? '/';
 include 'lib/header.php';
 ?>
 
