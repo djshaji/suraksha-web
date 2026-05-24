@@ -4,6 +4,7 @@
 - Stack: PHP 8.1+, server-rendered web app with JSON API backend.
 - Entry point: [index.php](index.php).
 - Shared web components and auth helpers: [lib/](lib/).
+- Auth model: web pages use session auth; API uses JWT access tokens with DB-backed refresh tokens.
 - Backend/API implementation details: [docs/API.md](docs/API.md).
 - Backend/API implementation plan and constraints: [docs/plan.md](docs/plan.md).
 
@@ -12,7 +13,9 @@
 - [docs/plan.md](docs/plan.md): Backend scope and implementation checklist.
 - [index.php](index.php): Current landing page composition.
 - [dashboard.php](dashboard.php): DB-backed dashboard page and query patterns.
+- [scan.php](scan.php): QR scan flow and protected page behavior.
 - [api/](api/): Auth, refresh, record entry, and health endpoints.
+- [api/session_token.php](api/session_token.php): Session-to-JWT bridge endpoint for logged-in web users.
 - [lib/composer.json](lib/composer.json): PHP dependencies used in this repo.
 
 ## Working Conventions
@@ -30,13 +33,18 @@
 - Apply schema and sample data:
   - `./scripts/apply_schema.sh`
   - `./scripts/seed_sample_data.sh`
+- Seed or update a single guard:
+  - `./scripts/seed_guard.sh`
+- Run API smoke flow (auth -> refresh -> record entry):
+  - `./scripts/smoke_test_api.sh`
 
 ## Pitfalls
 - [lib/](lib/) is a symlink to `/var/www/lib`; repository-level changes to `lib/*` affect shared files outside repo root.
 - `composer.json` is not in repository root; dependencies are managed via [lib/composer.json](lib/composer.json).
 - [lib/login.php](lib/login.php) currently contains a hardcoded Google client ID; prefer environment/config values for production-ready changes.
-- Scripts in [scripts/](scripts/) read `.env` for CLI usage; Apache vhost env vars are available to web requests only.
+- Scripts in [scripts/](scripts/) read `.env` for CLI usage; web requests depend on server-provided env vars.
 - [scripts/](scripts/) is blocked from web access via [scripts/.htaccess](scripts/.htaccess).
+- Session login in web pages does not automatically issue API JWT tokens; use [api/auth_google.php](api/auth_google.php) (Android flow) or [api/session_token.php](api/session_token.php) (web-session bridge).
 
 ## Documentation Policy
 - Link to existing documentation instead of copying it into instruction files.

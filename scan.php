@@ -281,11 +281,15 @@ include 'lib/header.php';
             <input class="form-check-input" type="checkbox" id="webcamAssistToggle" checked>
             <label class="form-check-label ms-2" for="webcamAssistToggle">Webcam Assist</label>
           </div>
+          <div class="form-check form-switch d-inline-flex align-items-center ms-md-1">
+            <input class="form-check-input" type="checkbox" id="ocrAssistToggle" checked>
+            <label class="form-check-label ms-2" for="ocrAssistToggle">OCR Roll Assist</label>
+          </div>
         </div>
         <div id="tokenRequiredHint" class="scan-inline-hint mb-3" hidden>Session login will be used automatically. JWT token is optional.</div>
 
         <div id="scanStatus" class="scan-status">Ready. Start camera to scan barcode.</div>
-        <p class="scan-muted mt-2 mb-0">Accepted barcode payload formats: plain roll number, <span class="mono">ROLL|NAME</span>, or JSON <span class="mono">{"userId":"...","name":"..."}</span>.</p>
+        <p class="scan-muted mt-2 mb-0">Accepted payload formats: barcode text (plain roll number, <span class="mono">ROLL|NAME</span>, JSON <span class="mono">{"userId":"...","name":"..."}</span>) or OCR-detected 11-digit roll number.</p>
       </div>
 
       <div class="col-lg-5">
@@ -347,6 +351,7 @@ include 'lib/header.php';
   const tokenRequiredHint = document.getElementById('tokenRequiredHint');
   const autoRecordToggle = document.getElementById('autoRecordToggle');
   const webcamAssistToggle = document.getElementById('webcamAssistToggle');
+  const ocrAssistToggle = document.getElementById('ocrAssistToggle');
   const successAudio = new Audio('/assets/prompt.wav');
   successAudio.preload = 'auto';
 
@@ -379,6 +384,15 @@ include 'lib/header.php';
   let blurPauseActive = false;
   let lastBlurStatusAt = 0;
   let successOverlayActive = false;
+  let ocrModule = null;
+  let ocrWorker = null;
+  let ocrScanInterval = null;
+  let ocrBusy = false;
+  let ocrCanvas = null;
+  let ocrContext = null;
+  let ocrUnavailableReason = '';
+  let ocrInitWarned = false;
+  let ocrFrameCounter = 0;
 
   const scanData = {
     userId: '',
@@ -389,6 +403,10 @@ include 'lib/header.php';
 
   function isWebcamAssistEnabled() {
     return Boolean(webcamAssistToggle && webcamAssistToggle.checked);
+  }
+
+  function isOcrAssistEnabled() {
+    return Boolean(ocrAssistToggle && ocrAssistToggle.checked);
   }
 
   function updateAssistFrameStyle() {
@@ -422,6 +440,198 @@ include 'lib/header.php';
     analysisCanvas.width = 160;
     analysisCanvas.height = 90;
     analysisContext = analysisCanvas.getContext('2d', { willReadFrequently: true });
+  }
+
+  function ensureOcrCanvas() {
+    if (ocrCanvas && ocrContext) {
+      return;
+    }
+
+    ocrCanvas = document.createElement('canvas');
+    ocrCanvas.width = 640;
+    ocrCanvas.height = 360;
+    ocrContext = ocrCanvas.getContext('2d', { willReadFrequently: true });
+  }
+
+  async function getOcrModule() {
+    if (ocrModule) {
+      return ocrModule;
+    }
+
+    const mod = await import('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/+esm');
+    const normalized = (mod && mod.default && typeof mod.default.createWorker === 'function')
+      ? mod.default
+      : mod;
+
+    if (!normalized || typeof normalized.createWorker !== 'function') {
+      throw new Error('OCR library could not be initialized in this browser.');
+    }
+
+    ocrModule = normalized;
+    return ocrModule;
+  }
+
+  async function getOcrWorker() {
+    if (ocrWorker) {
+      return ocrWorker;
+    }
+
+    const Tesseract = await getOcrModule();
+    try {
+      ocrWorker = await Tesseract.createWorker('eng');
+    } catch (err) {
+      // Fallback signature for environments where createWorker expects an options object.
+      ocrWorker = await Tesseract.createWorker({
+        lang: 'eng',
+      });
+    }
+
+    ocrUnavailableReason = '';
+    ocrInitWarned = false;
+    return ocrWorker;
+  }
+
+  async function teardownOcrWorker() {
+    if (!ocrWorker) {
+      return;
+    }
+
+    try {
+      await ocrWorker.terminate();
+    } catch (err) {
+      // Ignore worker termination errors.
+    } finally {
+      ocrWorker = null;
+      ocrUnavailableReason = '';
+      ocrInitWarned = false;
+    }
+  }
+
+  function drawOcrRegion(region) {
+    if (!video || !ocrContext || !ocrCanvas) {
+      return;
+    }
+
+    const sw = video.videoWidth;
+    const sh = video.videoHeight;
+    if (sw <= 0 || sh <= 0) {
+      return;
+    }
+
+    let cropX = 0;
+    let cropY = 0;
+    let cropW = sw;
+    let cropH = sh;
+
+    if (region === 'lower') {
+      cropX = Math.floor(sw * 0.08);
+      cropY = Math.floor(sh * 0.54);
+      cropW = Math.floor(sw * 0.84);
+      cropH = Math.floor(sh * 0.42);
+    }
+
+    ocrContext.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, ocrCanvas.width, ocrCanvas.height);
+
+    applyBinaryThresholdForOcr();
+  }
+
+  function applyBinaryThresholdForOcr() {
+    if (!ocrContext || !ocrCanvas) {
+      return;
+    }
+
+    const frame = ocrContext.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
+    const px = frame.data;
+    const hist = new Uint32Array(256);
+    const grayValues = new Uint8Array(px.length / 4);
+
+    let total = 0;
+    for (let i = 0, p = 0; p < px.length; i++, p += 4) {
+      const gray = (px[p] * 299 + px[p + 1] * 587 + px[p + 2] * 114) / 1000;
+      const g = gray | 0;
+      grayValues[i] = g;
+      hist[g] += 1;
+      total += g;
+    }
+
+    let sumB = 0;
+    let wB = 0;
+    let maxVar = -1;
+    let threshold = 128;
+    const pixelCount = grayValues.length;
+
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t];
+      if (wB === 0) {
+        continue;
+      }
+
+      const wF = pixelCount - wB;
+      if (wF === 0) {
+        break;
+      }
+
+      sumB += t * hist[t];
+      const mB = sumB / wB;
+      const mF = (total - sumB) / wF;
+      const between = wB * wF * (mB - mF) * (mB - mF);
+      if (between > maxVar) {
+        maxVar = between;
+        threshold = t;
+      }
+    }
+
+    // Dark text on bright background is most common on printed IDs.
+    for (let i = 0, p = 0; i < grayValues.length; i++, p += 4) {
+      const bw = grayValues[i] > threshold ? 255 : 0;
+      px[p] = bw;
+      px[p + 1] = bw;
+      px[p + 2] = bw;
+      px[p + 3] = 255;
+    }
+
+    ocrContext.putImageData(frame, 0, 0);
+  }
+
+  async function recognizeRollFromRegion(worker, region) {
+    drawOcrRegion(region);
+    const recognized = await worker.recognize(ocrCanvas);
+    const text = recognized && recognized.data ? recognized.data.text : '';
+    const roll = extractElevenDigitRoll(text);
+    console.log('[OCR][' + region + '] text:', text);
+    if (roll) {
+      console.log('[OCR][' + region + '] matched roll:', roll);
+    }
+    return roll;
+  }
+
+  function extractElevenDigitRoll(text) {
+    const raw = String(text || '');
+    if (!raw.trim()) {
+      return '';
+    }
+
+    const direct = raw.match(/(?:^|\D)(\d{11})(?:\D|$)/);
+    if (direct && direct[1]) {
+      return direct[1];
+    }
+
+    // OCR often inserts spaces or hyphens between digits.
+    const grouped = raw.match(/(?:\d[\s-]*){11,}/g) || [];
+    for (const candidate of grouped) {
+      const digits = candidate.replace(/\D/g, '');
+      if (digits.length === 11) {
+        return digits;
+      }
+      if (digits.length > 11) {
+        const nested = digits.match(/\d{11}/);
+        if (nested) {
+          return nested[0];
+        }
+      }
+    }
+
+    return '';
   }
 
   function shouldPauseDecodeForBlur() {
@@ -612,7 +822,7 @@ include 'lib/header.php';
     };
   }
 
-  function processDecodedRaw(rawValue) {
+  function processDecodedRaw(rawValue, source = 'barcode') {
     if (successOverlayActive) {
       return;
     }
@@ -631,7 +841,7 @@ include 'lib/header.php';
       return;
     }
 
-    const wasApplied = applyDecodedValue(value);
+    const wasApplied = applyDecodedValue(value, source);
     if (!wasApplied) {
       return;
     }
@@ -639,6 +849,79 @@ include 'lib/header.php';
     clearNativeFallbackTimer();
     lastRawValue = value;
     cooldownUntil = nowMs + 2000;
+  }
+
+  async function decodeFrameWithOcr() {
+    if (!isOcrAssistEnabled() || !scanning || ocrBusy || isSubmitting || successOverlayActive) {
+      return;
+    }
+
+    if (ocrUnavailableReason) {
+      if (!ocrInitWarned) {
+        setStatus(`OCR disabled: ${ocrUnavailableReason}`, true);
+        ocrInitWarned = true;
+      }
+      return;
+    }
+
+    if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
+      return;
+    }
+
+    if (shouldPauseDecodeForBlur()) {
+      return;
+    }
+
+    ensureOcrCanvas();
+    if (!ocrCanvas || !ocrContext) {
+      return;
+    }
+
+    ocrBusy = true;
+
+    try {
+      const worker = await getOcrWorker();
+
+      ocrFrameCounter += 1;
+      let roll = await recognizeRollFromRegion(worker, 'lower');
+      // Every few cycles, retry on full frame to handle layouts where text is not below the barcode.
+      if (!roll && ocrFrameCounter % 3 === 0) {
+        roll = await recognizeRollFromRegion(worker, 'full');
+      }
+
+      if (roll) {
+        processDecodedRaw(roll, 'ocr');
+      }
+    } catch (err) {
+      ocrUnavailableReason = 'OCR engine failed to initialize or load language data.';
+    } finally {
+      ocrBusy = false;
+    }
+  }
+
+  function startOcrLoop() {
+    if (!isOcrAssistEnabled()) {
+      return;
+    }
+
+    if (ocrScanInterval) {
+      clearInterval(ocrScanInterval);
+      ocrScanInterval = null;
+    }
+
+    ocrScanInterval = setInterval(() => {
+      void decodeFrameWithOcr();
+    }, 700);
+  }
+
+  function stopOcrLoop() {
+    if (ocrScanInterval) {
+      clearInterval(ocrScanInterval);
+      ocrScanInterval = null;
+    }
+
+    ocrBusy = false;
+    ocrFrameCounter = 0;
   }
 
   async function getZxingModule() {
@@ -727,6 +1010,7 @@ include 'lib/header.php';
     startBtn.disabled = true;
     stopBtn.disabled = false;
     setStatus('Camera started. Using ZXing fallback scanner. For fixed-focus webcams, hold code 20-35 cm away and fill most of the frame.');
+    startOcrLoop();
   }
 
   async function decodeFrameWithQuagga() {
@@ -807,6 +1091,7 @@ include 'lib/header.php';
     startBtn.disabled = true;
     stopBtn.disabled = false;
     setStatus('Camera started. Using Quagga2 (1D barcodes). For fixed-focus webcams, hold code steady and centered.');
+    startOcrLoop();
   }
 
   async function switchToZxingFallback() {
@@ -845,7 +1130,7 @@ include 'lib/header.php';
     probeStream.getTracks().forEach((track) => track.stop());
   }
 
-  function applyDecodedValue(rawValue) {
+  function applyDecodedValue(rawValue, source = 'barcode') {
     const parsed = parseBarcodeText(rawValue);
     if (!parsed || !parsed.userId) {
       return false;
@@ -857,7 +1142,8 @@ include 'lib/header.php';
     scanData.date = now.date;
     scanData.time = now.time;
     updatePreview();
-    setStatus(`Detected barcode: ${parsed.userId}. Ready to record entry.`);
+    const sourceLabel = source === 'ocr' ? 'OCR roll number' : 'barcode';
+    setStatus(`Detected ${sourceLabel}: ${parsed.userId}. Ready to record entry.`);
 
     if (autoRecordToggle && autoRecordToggle.checked) {
       void triggerAutoRecord();
@@ -971,6 +1257,7 @@ include 'lib/header.php';
         startBtn.disabled = true;
         stopBtn.disabled = false;
         setStatus('Camera started. Using native BarcodeDetector. For fixed-focus webcams, hold code 20-35 cm away and fill most of the frame.');
+        startOcrLoop();
         scanLoop();
 
         if (selectedApi === 'auto') {
@@ -1009,6 +1296,7 @@ include 'lib/header.php';
   function stopCamera() {
     scanning = false;
     clearNativeFallbackTimer();
+    stopOcrLoop();
 
     if (rafId) {
       cancelAnimationFrame(rafId);
@@ -1043,6 +1331,8 @@ include 'lib/header.php';
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('Camera stopped.');
+
+    void teardownOcrWorker();
   }
 
   async function submitEntry(options = {}) {
@@ -1192,6 +1482,20 @@ include 'lib/header.php';
         setStatus('Webcam Assist disabled. Scanner running normally.');
       } else {
         setStatus('Webcam Assist enabled. Tighter frame and blur pause are active.');
+      }
+    });
+  }
+
+  if (ocrAssistToggle) {
+    ocrAssistToggle.addEventListener('change', () => {
+      if (ocrAssistToggle.checked) {
+        if (scanning) {
+          startOcrLoop();
+        }
+        setStatus('OCR Roll Assist enabled. Trying barcode and OCR in parallel.');
+      } else {
+        stopOcrLoop();
+        setStatus('OCR Roll Assist disabled. Barcode scanning only.');
       }
     });
   }
