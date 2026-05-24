@@ -8,11 +8,9 @@ import pytesseract
 
 
 def preprocess_for_ocr(frame):
-	"""Convert frame to a high-contrast binary image for better OCR."""
+	"""Convert frame to grayscale for OCR without thresholding."""
 	gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-	denoised = cv2.GaussianBlur(gray, (3, 3), 0)
-	_, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-	return binary
+	return gray
 
 
 def main():

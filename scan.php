@@ -157,6 +157,15 @@ include 'lib/header.php';
       padding: 6px 10px;
     }
 
+    .ocr-preview-canvas {
+      width: 100%;
+      max-width: 320px;
+      border: 1px solid #d9e7dd;
+      border-radius: 10px;
+      background: #0f1c14;
+      image-rendering: crisp-edges;
+    }
+
     .token-state {
       display: inline-flex;
       align-items: center;
@@ -324,6 +333,11 @@ include 'lib/header.php';
             <div class="scan-label">Entry Time</div>
             <p id="scanTime" class="scan-value">-</p>
           </div>
+          <div class="mt-3">
+            <div class="scan-label">OCR Input Preview</div>
+            <canvas id="ocrPreviewCanvas" class="ocr-preview-canvas" width="320" height="180"></canvas>
+            <p id="ocrPreviewTag" class="scan-muted mb-0 mt-2">Waiting for OCR frame...</p>
+          </div>
         </div>
       </div>
     </div>
@@ -352,6 +366,8 @@ include 'lib/header.php';
   const autoRecordToggle = document.getElementById('autoRecordToggle');
   const webcamAssistToggle = document.getElementById('webcamAssistToggle');
   const ocrAssistToggle = document.getElementById('ocrAssistToggle');
+  const ocrPreviewCanvas = document.getElementById('ocrPreviewCanvas');
+  const ocrPreviewTag = document.getElementById('ocrPreviewTag');
   const successAudio = new Audio('/assets/prompt.wav');
   successAudio.preload = 'auto';
 
@@ -392,7 +408,7 @@ include 'lib/header.php';
   let ocrContext = null;
   let ocrUnavailableReason = '';
   let ocrInitWarned = false;
-  let ocrFrameCounter = 0;
+  let ocrPreviewContext = ocrPreviewCanvas ? ocrPreviewCanvas.getContext('2d') : null;
 
   const scanData = {
     userId: '',
@@ -448,8 +464,9 @@ include 'lib/header.php';
     }
 
     ocrCanvas = document.createElement('canvas');
-    ocrCanvas.width = 640;
-    ocrCanvas.height = 360;
+    // Smaller OCR surface improves recognition latency.
+    ocrCanvas.width = 480;
+    ocrCanvas.height = 220;
     ocrContext = ocrCanvas.getContext('2d', { willReadFrequently: true });
   }
 
@@ -484,6 +501,17 @@ include 'lib/header.php';
       ocrWorker = await Tesseract.createWorker({
         lang: 'eng',
       });
+    }
+
+    if (ocrWorker && typeof ocrWorker.setParameters === 'function') {
+      try {
+        await ocrWorker.setParameters({
+          tessedit_char_whitelist: '0123456789',
+          tessedit_pageseg_mode: '7',
+        });
+      } catch (err) {
+        // Keep defaults if parameter tuning isn't supported in this runtime.
+      }
     }
 
     ocrUnavailableReason = '';
@@ -523,7 +551,15 @@ include 'lib/header.php';
     let cropW = sw;
     let cropH = sh;
 
-    if (region === 'lower') {
+    if (region === 'frame') {
+      const frameCrop = getOverlayFrameCrop();
+      if (frameCrop) {
+        cropX = frameCrop.x;
+        cropY = frameCrop.y;
+        cropW = frameCrop.w;
+        cropH = frameCrop.h;
+      }
+    } else if (region === 'lower') {
       cropX = Math.floor(sw * 0.08);
       cropY = Math.floor(sh * 0.54);
       cropW = Math.floor(sw * 0.84);
@@ -532,61 +568,86 @@ include 'lib/header.php';
 
     ocrContext.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, ocrCanvas.width, ocrCanvas.height);
 
-    applyBinaryThresholdForOcr();
+    applyGrayscaleForOcr();
+    updateOcrPreview(region);
   }
 
-  function applyBinaryThresholdForOcr() {
+  function getOverlayFrameCrop() {
+    if (!video || !scanFrame) {
+      return null;
+    }
+
+    const sw = video.videoWidth;
+    const sh = video.videoHeight;
+    if (sw <= 0 || sh <= 0) {
+      return null;
+    }
+
+    const videoRect = video.getBoundingClientRect();
+    const frameRect = scanFrame.getBoundingClientRect();
+    const vw = video.clientWidth || videoRect.width;
+    const vh = video.clientHeight || videoRect.height;
+    if (vw <= 0 || vh <= 0) {
+      return null;
+    }
+
+    // video uses object-fit: cover, so map visible crop area back to source pixels.
+    const scale = Math.max(vw / sw, vh / sh);
+    const displayedW = sw * scale;
+    const displayedH = sh * scale;
+    const cropOffsetX = (displayedW - vw) / 2;
+    const cropOffsetY = (displayedH - vh) / 2;
+
+    const relX = frameRect.left - videoRect.left;
+    const relY = frameRect.top - videoRect.top;
+    const relW = frameRect.width;
+    const relH = frameRect.height;
+
+    const srcX = Math.floor((relX + cropOffsetX) / scale);
+    const srcY = Math.floor((relY + cropOffsetY) / scale);
+    const srcW = Math.floor(relW / scale);
+    const srcH = Math.floor(relH / scale);
+
+    const x = Math.max(0, Math.min(sw - 1, srcX));
+    const y = Math.max(0, Math.min(sh - 1, srcY));
+    const maxW = sw - x;
+    const maxH = sh - y;
+    const w = Math.max(1, Math.min(maxW, srcW));
+    const h = Math.max(1, Math.min(maxH, srcH));
+
+    return { x, y, w, h };
+  }
+
+  function updateOcrPreview(region) {
+    if (!ocrPreviewContext || !ocrPreviewCanvas || !ocrCanvas) {
+      return;
+    }
+
+    ocrPreviewContext.drawImage(ocrCanvas, 0, 0, ocrPreviewCanvas.width, ocrPreviewCanvas.height);
+    if (ocrPreviewTag) {
+      let label = 'lower region';
+      if (region === 'full') {
+        label = 'full frame';
+      } else if (region === 'frame') {
+        label = 'scan frame bounding box';
+      }
+      ocrPreviewTag.textContent = `Showing grayscale OCR input (${label}).`;
+    }
+  }
+
+  function applyGrayscaleForOcr() {
     if (!ocrContext || !ocrCanvas) {
       return;
     }
 
     const frame = ocrContext.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
     const px = frame.data;
-    const hist = new Uint32Array(256);
-    const grayValues = new Uint8Array(px.length / 4);
-
-    let total = 0;
-    for (let i = 0, p = 0; p < px.length; i++, p += 4) {
+    for (let p = 0; p < px.length; p += 4) {
       const gray = (px[p] * 299 + px[p + 1] * 587 + px[p + 2] * 114) / 1000;
       const g = gray | 0;
-      grayValues[i] = g;
-      hist[g] += 1;
-      total += g;
-    }
-
-    let sumB = 0;
-    let wB = 0;
-    let maxVar = -1;
-    let threshold = 128;
-    const pixelCount = grayValues.length;
-
-    for (let t = 0; t < 256; t++) {
-      wB += hist[t];
-      if (wB === 0) {
-        continue;
-      }
-
-      const wF = pixelCount - wB;
-      if (wF === 0) {
-        break;
-      }
-
-      sumB += t * hist[t];
-      const mB = sumB / wB;
-      const mF = (total - sumB) / wF;
-      const between = wB * wF * (mB - mF) * (mB - mF);
-      if (between > maxVar) {
-        maxVar = between;
-        threshold = t;
-      }
-    }
-
-    // Dark text on bright background is most common on printed IDs.
-    for (let i = 0, p = 0; i < grayValues.length; i++, p += 4) {
-      const bw = grayValues[i] > threshold ? 255 : 0;
-      px[p] = bw;
-      px[p + 1] = bw;
-      px[p + 2] = bw;
+      px[p] = g;
+      px[p + 1] = g;
+      px[p + 2] = g;
       px[p + 3] = 255;
     }
 
@@ -612,26 +673,7 @@ include 'lib/header.php';
     }
 
     const direct = raw.match(/(?:^|\D)(\d{11})(?:\D|$)/);
-    if (direct && direct[1]) {
-      return direct[1];
-    }
-
-    // OCR often inserts spaces or hyphens between digits.
-    const grouped = raw.match(/(?:\d[\s-]*){11,}/g) || [];
-    for (const candidate of grouped) {
-      const digits = candidate.replace(/\D/g, '');
-      if (digits.length === 11) {
-        return digits;
-      }
-      if (digits.length > 11) {
-        const nested = digits.match(/\d{11}/);
-        if (nested) {
-          return nested[0];
-        }
-      }
-    }
-
-    return '';
+    return direct && direct[1] ? direct[1] : '';
   }
 
   function shouldPauseDecodeForBlur() {
@@ -882,12 +924,7 @@ include 'lib/header.php';
     try {
       const worker = await getOcrWorker();
 
-      ocrFrameCounter += 1;
-      let roll = await recognizeRollFromRegion(worker, 'lower');
-      // Every few cycles, retry on full frame to handle layouts where text is not below the barcode.
-      if (!roll && ocrFrameCounter % 3 === 0) {
-        roll = await recognizeRollFromRegion(worker, 'full');
-      }
+      const roll = await recognizeRollFromRegion(worker, 'frame');
 
       if (roll) {
         processDecodedRaw(roll, 'ocr');
@@ -911,7 +948,7 @@ include 'lib/header.php';
 
     ocrScanInterval = setInterval(() => {
       void decodeFrameWithOcr();
-    }, 700);
+    }, 350);
   }
 
   function stopOcrLoop() {
@@ -921,7 +958,13 @@ include 'lib/header.php';
     }
 
     ocrBusy = false;
-    ocrFrameCounter = 0;
+
+    if (ocrPreviewContext && ocrPreviewCanvas) {
+      ocrPreviewContext.clearRect(0, 0, ocrPreviewCanvas.width, ocrPreviewCanvas.height);
+    }
+    if (ocrPreviewTag) {
+      ocrPreviewTag.textContent = 'Waiting for OCR frame...';
+    }
   }
 
   async function getZxingModule() {
