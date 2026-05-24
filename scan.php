@@ -58,16 +58,41 @@ include 'lib/header.php';
     }
 
     .scan-frame {
-      width: min(78%, 340px);
-      aspect-ratio: 2 / 1;
+      position: relative;
+      width: min(56%, 250px);
+      aspect-ratio: 3 / 5;
       border: 3px solid rgba(255, 255, 255, 0.9);
       border-radius: 14px;
       box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.28);
+      overflow: hidden;
       transition: width 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
     }
 
+    .scan-frame::before {
+      content: "";
+      position: absolute;
+      width: 58%;
+      aspect-ratio: 1 / 1;
+      left: 50%;
+      top: 36%;
+      transform: translateX(-50%);
+      border: 2px dashed rgba(255, 255, 255, 0.8);
+      border-radius: 10px;
+    }
+
+    .scan-frame::after {
+      content: "";
+      position: absolute;
+      width: 20%;
+      aspect-ratio: 1 / 1;
+      left: 12%;
+      top: 16%;
+      border: 2px solid rgba(255, 255, 255, 0.75);
+      border-radius: 6px;
+    }
+
     .scan-frame.assist-mode {
-      width: min(62%, 280px);
+      width: min(60%, 270px);
       border-color: rgba(255, 224, 120, 0.95);
       box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.4);
     }
@@ -155,15 +180,6 @@ include 'lib/header.php';
       border: 1px solid rgba(157, 2, 8, 0.2);
       border-radius: 10px;
       padding: 6px 10px;
-    }
-
-    .ocr-preview-canvas {
-      width: 100%;
-      max-width: 320px;
-      border: 1px solid #d9e7dd;
-      border-radius: 10px;
-      background: #0f1c14;
-      image-rendering: crisp-edges;
     }
 
     .token-state {
@@ -272,14 +288,13 @@ include 'lib/header.php';
         <div class="d-flex flex-wrap gap-2 mb-3">
           <button id="startScanBtn" class="btn btn-success">Start Camera</button>
           <button id="stopScanBtn" class="btn btn-outline-secondary" disabled>Stop Camera</button>
-          <span id="submitEntryWrap" class="d-inline-block" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Scan barcode and load token first.">
+          <span id="submitEntryWrap" class="d-inline-block" tabindex="0" data-bs-toggle="tooltip" data-bs-placement="top" title="Scan QR code first.">
             <button id="submitEntryBtn" class="btn btn-primary" disabled>Record Entry</button>
           </span>
           <select id="scannerApiSelect" class="form-select" style="max-width: 220px;">
             <option value="auto" selected>Scanner API: Auto</option>
             <option value="native">Scanner API: Native</option>
             <option value="zxing">Scanner API: ZXing</option>
-            <option value="quagga">Scanner API: Quagga2 (1D)</option>
           </select>
           <button id="sessionTokenBtn" class="btn btn-outline-primary">Use Session Login</button>
           <div class="form-check form-switch d-inline-flex align-items-center ms-md-1">
@@ -290,15 +305,11 @@ include 'lib/header.php';
             <input class="form-check-input" type="checkbox" id="webcamAssistToggle" checked>
             <label class="form-check-label ms-2" for="webcamAssistToggle">Webcam Assist</label>
           </div>
-          <div class="form-check form-switch d-inline-flex align-items-center ms-md-1">
-            <input class="form-check-input" type="checkbox" id="ocrAssistToggle" checked>
-            <label class="form-check-label ms-2" for="ocrAssistToggle">OCR Roll Assist</label>
-          </div>
         </div>
         <div id="tokenRequiredHint" class="scan-inline-hint mb-3" hidden>Session login will be used automatically. JWT token is optional.</div>
 
-        <div id="scanStatus" class="scan-status">Ready. Start camera to scan barcode.</div>
-        <p class="scan-muted mt-2 mb-0">Accepted payload formats: barcode text (plain roll number, <span class="mono">ROLL|NAME</span>, JSON <span class="mono">{"userId":"...","name":"..."}</span>) or OCR-detected 11-digit roll number.</p>
+        <div id="scanStatus" class="scan-status">Ready. Start camera to scan QR code.</div>
+        <p class="scan-muted mt-2 mb-0">Accepted QR payload formats: plain roll number, <span class="mono">ROLL|NAME</span>, or JSON <span class="mono">{"userId":"...","name":"..."}</span>.</p>
       </div>
 
       <div class="col-lg-5">
@@ -333,11 +344,6 @@ include 'lib/header.php';
             <div class="scan-label">Entry Time</div>
             <p id="scanTime" class="scan-value">-</p>
           </div>
-          <div class="mt-3">
-            <div class="scan-label">OCR Input Preview</div>
-            <canvas id="ocrPreviewCanvas" class="ocr-preview-canvas" width="320" height="180"></canvas>
-            <p id="ocrPreviewTag" class="scan-muted mb-0 mt-2">Waiting for OCR frame...</p>
-          </div>
         </div>
       </div>
     </div>
@@ -365,9 +371,6 @@ include 'lib/header.php';
   const tokenRequiredHint = document.getElementById('tokenRequiredHint');
   const autoRecordToggle = document.getElementById('autoRecordToggle');
   const webcamAssistToggle = document.getElementById('webcamAssistToggle');
-  const ocrAssistToggle = document.getElementById('ocrAssistToggle');
-  const ocrPreviewCanvas = document.getElementById('ocrPreviewCanvas');
-  const ocrPreviewTag = document.getElementById('ocrPreviewTag');
   const successAudio = new Audio('/assets/prompt.wav');
   successAudio.preload = 'auto';
 
@@ -381,11 +384,6 @@ include 'lib/header.php';
   let zxingModule = null;
   let zxingReader = null;
   let zxingControls = null;
-  let quaggaModule = null;
-  let quaggaScanInterval = null;
-  let quaggaDecodeBusy = false;
-  let quaggaCanvas = null;
-  let quaggaContext = null;
   let scannerMode = 'native';
   let rafId = null;
   let nativeFallbackTimer = null;
@@ -400,15 +398,6 @@ include 'lib/header.php';
   let blurPauseActive = false;
   let lastBlurStatusAt = 0;
   let successOverlayActive = false;
-  let ocrModule = null;
-  let ocrWorker = null;
-  let ocrScanInterval = null;
-  let ocrBusy = false;
-  let ocrCanvas = null;
-  let ocrContext = null;
-  let ocrUnavailableReason = '';
-  let ocrInitWarned = false;
-  let ocrPreviewContext = ocrPreviewCanvas ? ocrPreviewCanvas.getContext('2d') : null;
 
   const scanData = {
     userId: '',
@@ -419,10 +408,6 @@ include 'lib/header.php';
 
   function isWebcamAssistEnabled() {
     return Boolean(webcamAssistToggle && webcamAssistToggle.checked);
-  }
-
-  function isOcrAssistEnabled() {
-    return Boolean(ocrAssistToggle && ocrAssistToggle.checked);
   }
 
   function updateAssistFrameStyle() {
@@ -444,7 +429,7 @@ include 'lib/header.php';
       return;
     }
 
-    scannerApiSelect.value = isProbablyMobileDevice() ? 'auto' : 'quagga';
+    scannerApiSelect.value = isProbablyMobileDevice() ? 'auto' : 'zxing';
   }
 
   function ensureAnalysisCanvas() {
@@ -456,224 +441,6 @@ include 'lib/header.php';
     analysisCanvas.width = 160;
     analysisCanvas.height = 90;
     analysisContext = analysisCanvas.getContext('2d', { willReadFrequently: true });
-  }
-
-  function ensureOcrCanvas() {
-    if (ocrCanvas && ocrContext) {
-      return;
-    }
-
-    ocrCanvas = document.createElement('canvas');
-    // Smaller OCR surface improves recognition latency.
-    ocrCanvas.width = 480;
-    ocrCanvas.height = 220;
-    ocrContext = ocrCanvas.getContext('2d', { willReadFrequently: true });
-  }
-
-  async function getOcrModule() {
-    if (ocrModule) {
-      return ocrModule;
-    }
-
-    const mod = await import('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/+esm');
-    const normalized = (mod && mod.default && typeof mod.default.createWorker === 'function')
-      ? mod.default
-      : mod;
-
-    if (!normalized || typeof normalized.createWorker !== 'function') {
-      throw new Error('OCR library could not be initialized in this browser.');
-    }
-
-    ocrModule = normalized;
-    return ocrModule;
-  }
-
-  async function getOcrWorker() {
-    if (ocrWorker) {
-      return ocrWorker;
-    }
-
-    const Tesseract = await getOcrModule();
-    try {
-      ocrWorker = await Tesseract.createWorker('eng');
-    } catch (err) {
-      // Fallback signature for environments where createWorker expects an options object.
-      ocrWorker = await Tesseract.createWorker({
-        lang: 'eng',
-      });
-    }
-
-    if (ocrWorker && typeof ocrWorker.setParameters === 'function') {
-      try {
-        await ocrWorker.setParameters({
-          tessedit_char_whitelist: '0123456789',
-          tessedit_pageseg_mode: '7',
-        });
-      } catch (err) {
-        // Keep defaults if parameter tuning isn't supported in this runtime.
-      }
-    }
-
-    ocrUnavailableReason = '';
-    ocrInitWarned = false;
-    return ocrWorker;
-  }
-
-  async function teardownOcrWorker() {
-    if (!ocrWorker) {
-      return;
-    }
-
-    try {
-      await ocrWorker.terminate();
-    } catch (err) {
-      // Ignore worker termination errors.
-    } finally {
-      ocrWorker = null;
-      ocrUnavailableReason = '';
-      ocrInitWarned = false;
-    }
-  }
-
-  function drawOcrRegion(region) {
-    if (!video || !ocrContext || !ocrCanvas) {
-      return;
-    }
-
-    const sw = video.videoWidth;
-    const sh = video.videoHeight;
-    if (sw <= 0 || sh <= 0) {
-      return;
-    }
-
-    let cropX = 0;
-    let cropY = 0;
-    let cropW = sw;
-    let cropH = sh;
-
-    if (region === 'frame') {
-      const frameCrop = getOverlayFrameCrop();
-      if (frameCrop) {
-        cropX = frameCrop.x;
-        cropY = frameCrop.y;
-        cropW = frameCrop.w;
-        cropH = frameCrop.h;
-      }
-    } else if (region === 'lower') {
-      cropX = Math.floor(sw * 0.08);
-      cropY = Math.floor(sh * 0.54);
-      cropW = Math.floor(sw * 0.84);
-      cropH = Math.floor(sh * 0.42);
-    }
-
-    ocrContext.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, ocrCanvas.width, ocrCanvas.height);
-
-    applyGrayscaleForOcr();
-    updateOcrPreview(region);
-  }
-
-  function getOverlayFrameCrop() {
-    if (!video || !scanFrame) {
-      return null;
-    }
-
-    const sw = video.videoWidth;
-    const sh = video.videoHeight;
-    if (sw <= 0 || sh <= 0) {
-      return null;
-    }
-
-    const videoRect = video.getBoundingClientRect();
-    const frameRect = scanFrame.getBoundingClientRect();
-    const vw = video.clientWidth || videoRect.width;
-    const vh = video.clientHeight || videoRect.height;
-    if (vw <= 0 || vh <= 0) {
-      return null;
-    }
-
-    // video uses object-fit: cover, so map visible crop area back to source pixels.
-    const scale = Math.max(vw / sw, vh / sh);
-    const displayedW = sw * scale;
-    const displayedH = sh * scale;
-    const cropOffsetX = (displayedW - vw) / 2;
-    const cropOffsetY = (displayedH - vh) / 2;
-
-    const relX = frameRect.left - videoRect.left;
-    const relY = frameRect.top - videoRect.top;
-    const relW = frameRect.width;
-    const relH = frameRect.height;
-
-    const srcX = Math.floor((relX + cropOffsetX) / scale);
-    const srcY = Math.floor((relY + cropOffsetY) / scale);
-    const srcW = Math.floor(relW / scale);
-    const srcH = Math.floor(relH / scale);
-
-    const x = Math.max(0, Math.min(sw - 1, srcX));
-    const y = Math.max(0, Math.min(sh - 1, srcY));
-    const maxW = sw - x;
-    const maxH = sh - y;
-    const w = Math.max(1, Math.min(maxW, srcW));
-    const h = Math.max(1, Math.min(maxH, srcH));
-
-    return { x, y, w, h };
-  }
-
-  function updateOcrPreview(region) {
-    if (!ocrPreviewContext || !ocrPreviewCanvas || !ocrCanvas) {
-      return;
-    }
-
-    ocrPreviewContext.drawImage(ocrCanvas, 0, 0, ocrPreviewCanvas.width, ocrPreviewCanvas.height);
-    if (ocrPreviewTag) {
-      let label = 'lower region';
-      if (region === 'full') {
-        label = 'full frame';
-      } else if (region === 'frame') {
-        label = 'scan frame bounding box';
-      }
-      ocrPreviewTag.textContent = `Showing grayscale OCR input (${label}).`;
-    }
-  }
-
-  function applyGrayscaleForOcr() {
-    if (!ocrContext || !ocrCanvas) {
-      return;
-    }
-
-    const frame = ocrContext.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
-    const px = frame.data;
-    for (let p = 0; p < px.length; p += 4) {
-      const gray = (px[p] * 299 + px[p + 1] * 587 + px[p + 2] * 114) / 1000;
-      const g = gray | 0;
-      px[p] = g;
-      px[p + 1] = g;
-      px[p + 2] = g;
-      px[p + 3] = 255;
-    }
-
-    ocrContext.putImageData(frame, 0, 0);
-  }
-
-  async function recognizeRollFromRegion(worker, region) {
-    drawOcrRegion(region);
-    const recognized = await worker.recognize(ocrCanvas);
-    const text = recognized && recognized.data ? recognized.data.text : '';
-    const roll = extractElevenDigitRoll(text);
-    console.log('[OCR][' + region + '] text:', text);
-    if (roll) {
-      console.log('[OCR][' + region + '] matched roll:', roll);
-    }
-    return roll;
-  }
-
-  function extractElevenDigitRoll(text) {
-    const raw = String(text || '');
-    if (!raw.trim()) {
-      return '';
-    }
-
-    const direct = raw.match(/(?:^|\D)(\d{11})(?:\D|$)/);
-    return direct && direct[1] ? direct[1] : '';
   }
 
   function shouldPauseDecodeForBlur() {
@@ -735,7 +502,7 @@ include 'lib/header.php';
 
     if (blurPauseActive && (now - lastBlurStatusAt) > 1400) {
       lastBlurStatusAt = now;
-      setStatus('Webcam Assist: motion blur detected, pausing decode. Hold code steady for a moment.');
+      setStatus('Webcam Assist: motion blur detected, pausing decode. Hold QR steady for a moment.');
     }
 
     return blurPauseActive;
@@ -747,7 +514,6 @@ include 'lib/header.php';
       width: { ideal: 1920 },
       height: { ideal: 1080 },
       frameRate: { ideal: 24, max: 30 },
-      // Browsers ignore unsupported constraints, but use them when available.
       focusMode: 'continuous',
       advanced: [
         { focusMode: 'continuous' },
@@ -763,7 +529,6 @@ include 'lib/header.php';
         audio: false
       });
     } catch (err) {
-      // Fallback for webcams/drivers that reject advanced constraints.
       return navigator.mediaDevices.getUserMedia({
         video: true,
         audio: false
@@ -808,10 +573,6 @@ include 'lib/header.php';
     updateSubmitAvailability();
   }
 
-  function hasUsableToken() {
-    return tokenInput.value.trim().length > 0;
-  }
-
   function updateSubmitAvailability() {
     const hasScanData = Boolean(scanData.userId);
     submitBtn.disabled = !hasScanData || isSubmitting;
@@ -819,7 +580,7 @@ include 'lib/header.php';
 
     let tooltipReason = '';
     if (!hasScanData) {
-      tooltipReason = 'Scan a barcode before recording entry.';
+      tooltipReason = 'Scan a QR code before recording entry.';
     }
 
     if (isSubmitting) {
@@ -832,7 +593,7 @@ include 'lib/header.php';
     }
   }
 
-  function parseBarcodeText(raw) {
+  function parseQrPayload(raw) {
     const trimmed = (raw || '').trim();
     if (!trimmed) {
       return null;
@@ -847,7 +608,7 @@ include 'lib/header.php';
         };
       }
     } catch (err) {
-      // Not JSON payload. Continue with text parsing.
+      // Not JSON payload.
     }
 
     if (trimmed.includes('|')) {
@@ -864,7 +625,16 @@ include 'lib/header.php';
     };
   }
 
-  function processDecodedRaw(rawValue, source = 'barcode') {
+  function clearNativeFallbackTimer() {
+    if (!nativeFallbackTimer) {
+      return;
+    }
+
+    clearTimeout(nativeFallbackTimer);
+    nativeFallbackTimer = null;
+  }
+
+  function processDecodedRaw(rawValue) {
     if (successOverlayActive) {
       return;
     }
@@ -883,87 +653,25 @@ include 'lib/header.php';
       return;
     }
 
-    const wasApplied = applyDecodedValue(value, source);
-    if (!wasApplied) {
+    const parsed = parseQrPayload(value);
+    if (!parsed || !parsed.userId) {
       return;
     }
+
+    const now = formatNow();
+    scanData.userId = parsed.userId;
+    scanData.name = parsed.name;
+    scanData.date = now.date;
+    scanData.time = now.time;
+    updatePreview();
+    setStatus(`Detected QR: ${parsed.userId}. Ready to record entry.`);
 
     clearNativeFallbackTimer();
     lastRawValue = value;
     cooldownUntil = nowMs + 2000;
-  }
 
-  async function decodeFrameWithOcr() {
-    if (!isOcrAssistEnabled() || !scanning || ocrBusy || isSubmitting || successOverlayActive) {
-      return;
-    }
-
-    if (ocrUnavailableReason) {
-      if (!ocrInitWarned) {
-        setStatus(`OCR disabled: ${ocrUnavailableReason}`, true);
-        ocrInitWarned = true;
-      }
-      return;
-    }
-
-    if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
-      return;
-    }
-
-    if (shouldPauseDecodeForBlur()) {
-      return;
-    }
-
-    ensureOcrCanvas();
-    if (!ocrCanvas || !ocrContext) {
-      return;
-    }
-
-    ocrBusy = true;
-
-    try {
-      const worker = await getOcrWorker();
-
-      const roll = await recognizeRollFromRegion(worker, 'frame');
-
-      if (roll) {
-        processDecodedRaw(roll, 'ocr');
-      }
-    } catch (err) {
-      ocrUnavailableReason = 'OCR engine failed to initialize or load language data.';
-    } finally {
-      ocrBusy = false;
-    }
-  }
-
-  function startOcrLoop() {
-    if (!isOcrAssistEnabled()) {
-      return;
-    }
-
-    if (ocrScanInterval) {
-      clearInterval(ocrScanInterval);
-      ocrScanInterval = null;
-    }
-
-    ocrScanInterval = setInterval(() => {
-      void decodeFrameWithOcr();
-    }, 350);
-  }
-
-  function stopOcrLoop() {
-    if (ocrScanInterval) {
-      clearInterval(ocrScanInterval);
-      ocrScanInterval = null;
-    }
-
-    ocrBusy = false;
-
-    if (ocrPreviewContext && ocrPreviewCanvas) {
-      ocrPreviewContext.clearRect(0, 0, ocrPreviewCanvas.width, ocrPreviewCanvas.height);
-    }
-    if (ocrPreviewTag) {
-      ocrPreviewTag.textContent = 'Waiting for OCR frame...';
+    if (autoRecordToggle && autoRecordToggle.checked) {
+      void submitEntry({ fromAuto: true });
     }
   }
 
@@ -976,51 +684,15 @@ include 'lib/header.php';
     return zxingModule;
   }
 
-  async function getQuaggaModule() {
-    if (quaggaModule) {
-      return quaggaModule;
-    }
-
-    const mod = await import('https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.2/+esm');
-    quaggaModule = mod.default || mod;
-    return quaggaModule;
-  }
-
-  function ensureQuaggaCanvas() {
-    if (quaggaCanvas && quaggaContext) {
-      return;
-    }
-
-    quaggaCanvas = document.createElement('canvas');
-    quaggaCanvas.width = 960;
-    quaggaCanvas.height = 540;
-    quaggaContext = quaggaCanvas.getContext('2d');
-  }
-
-  function clearNativeFallbackTimer() {
-    if (!nativeFallbackTimer) {
-      return;
-    }
-
-    clearTimeout(nativeFallbackTimer);
-    nativeFallbackTimer = null;
-  }
-
   async function startZxingScanner() {
     scannerMode = 'zxing';
-    setStatus('Starting ZXing fallback scanner...');
+    setStatus('Starting ZXing QR scanner...');
 
     const ZXing = await getZxingModule();
     const hints = new Map();
     if (ZXing.DecodeHintType && ZXing.BarcodeFormat) {
       hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-        ZXing.BarcodeFormat.QR_CODE,
-        ZXing.BarcodeFormat.CODE_128,
-        ZXing.BarcodeFormat.CODE_39,
-        ZXing.BarcodeFormat.EAN_13,
-        ZXing.BarcodeFormat.UPC_A
-      ]);
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.QR_CODE]);
     }
 
     zxingReader = new ZXing.BrowserMultiFormatReader(hints, 150);
@@ -1052,89 +724,30 @@ include 'lib/header.php';
     scanning = true;
     startBtn.disabled = true;
     stopBtn.disabled = false;
-    setStatus('Camera started. Using ZXing fallback scanner. For fixed-focus webcams, hold code 20-35 cm away and fill most of the frame.');
-    startOcrLoop();
+    setStatus('Camera started. Using ZXing QR scanner.');
   }
 
-  async function decodeFrameWithQuagga() {
-    if (!video || video.readyState < 2 || quaggaDecodeBusy) {
+  async function scanLoop() {
+    if (!scanning || !detector) {
       return;
     }
 
     if (shouldPauseDecodeForBlur()) {
+      rafId = requestAnimationFrame(scanLoop);
       return;
     }
-
-    ensureQuaggaCanvas();
-    if (!quaggaContext || !quaggaCanvas) {
-      return;
-    }
-
-    quaggaDecodeBusy = true;
 
     try {
-      const sourceWidth = video.videoWidth || 1280;
-      const sourceHeight = video.videoHeight || 720;
-      quaggaCanvas.width = sourceWidth;
-      quaggaCanvas.height = sourceHeight;
-      quaggaContext.drawImage(video, 0, 0, sourceWidth, sourceHeight);
-
-      const frameDataUrl = quaggaCanvas.toDataURL('image/jpeg', 0.9);
-      const Quagga = await getQuaggaModule();
-
-      await new Promise((resolve) => {
-        Quagga.decodeSingle({
-          src: frameDataUrl,
-          numOfWorkers: 0,
-          locate: true,
-          inputStream: {
-            size: 960,
-            singleChannel: false
-          },
-          decoder: {
-            readers: [
-              'code_128_reader',
-              'code_39_reader',
-              'ean_reader',
-              'upc_reader'
-            ]
-          }
-        }, (result) => {
-          if (result && result.codeResult && result.codeResult.code) {
-            processDecodedRaw(String(result.codeResult.code));
-          }
-          resolve();
-        });
-      });
+      const codes = await detector.detect(video);
+      if (Array.isArray(codes) && codes.length > 0) {
+        const first = codes.find((item) => item.rawValue) || codes[0];
+        processDecodedRaw(first.rawValue || '');
+      }
     } catch (err) {
-      // Ignore intermittent frame decode failures.
-    } finally {
-      quaggaDecodeBusy = false;
-    }
-  }
-
-  async function startQuaggaScanner() {
-    scannerMode = 'quagga';
-    setStatus('Starting Quagga2 scanner...');
-
-    mediaStream = await openPreferredCameraStream();
-    video.srcObject = mediaStream;
-    await video.play();
-
-    if (quaggaScanInterval) {
-      clearInterval(quaggaScanInterval);
-      quaggaScanInterval = null;
+      // Ignore transient detect errors.
     }
 
-    quaggaScanInterval = setInterval(() => {
-      void decodeFrameWithQuagga();
-    }, 220);
-
-    scanning = true;
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    setStatus('Camera started. Using Quagga2 (1D barcodes). For fixed-focus webcams, hold code steady and centered.');
-    startOcrLoop();
+    rafId = requestAnimationFrame(scanLoop);
   }
 
   async function switchToZxingFallback() {
@@ -1173,87 +786,6 @@ include 'lib/header.php';
     probeStream.getTracks().forEach((track) => track.stop());
   }
 
-  function applyDecodedValue(rawValue, source = 'barcode') {
-    const parsed = parseBarcodeText(rawValue);
-    if (!parsed || !parsed.userId) {
-      return false;
-    }
-
-    const now = formatNow();
-    scanData.userId = parsed.userId;
-    scanData.name = parsed.name;
-    scanData.date = now.date;
-    scanData.time = now.time;
-    updatePreview();
-    const sourceLabel = source === 'ocr' ? 'OCR roll number' : 'barcode';
-    setStatus(`Detected ${sourceLabel}: ${parsed.userId}. Ready to record entry.`);
-
-    if (autoRecordToggle && autoRecordToggle.checked) {
-      void triggerAutoRecord();
-    }
-
-    return true;
-  }
-
-  async function triggerAutoRecord() {
-    if (isSubmitting || !scanData.userId) {
-      return;
-    }
-
-    await submitEntry({ fromAuto: true });
-  }
-
-  function showSuccessAnimation() {
-    try {
-      successAudio.currentTime = 0;
-      const playPromise = successAudio.play();
-      if (playPromise && typeof playPromise.catch === 'function') {
-        playPromise.catch(() => {
-          // Ignore playback failures caused by browser autoplay policies.
-        });
-      }
-    } catch (err) {
-      // Ignore audio errors to avoid breaking scan flow.
-    }
-
-    if (checkmarkRoll) {
-      checkmarkRoll.textContent = scanData.userId ? `Roll: ${scanData.userId}` : '';
-    }
-
-    successOverlayActive = true;
-    checkmarkLayer.classList.add('active');
-    setTimeout(() => {
-      checkmarkLayer.classList.remove('active');
-      successOverlayActive = false;
-      if (checkmarkRoll) {
-        checkmarkRoll.textContent = '';
-      }
-    }, 3000);
-  }
-
-  async function scanLoop() {
-    if (!scanning || !detector) {
-      return;
-    }
-
-    if (shouldPauseDecodeForBlur()) {
-      rafId = requestAnimationFrame(scanLoop);
-      return;
-    }
-
-    try {
-      const barcodes = await detector.detect(video);
-      if (Array.isArray(barcodes) && barcodes.length > 0) {
-        const first = barcodes.find((item) => item.rawValue) || barcodes[0];
-        processDecodedRaw(first.rawValue || '');
-      }
-    } catch (err) {
-      // Ignore transient detect errors and continue scanning.
-    }
-
-    rafId = requestAnimationFrame(scanLoop);
-  }
-
   async function startCamera() {
     if (scanning) {
       return;
@@ -1275,32 +807,23 @@ include 'lib/header.php';
         return;
       }
 
-      if (selectedApi === 'quagga') {
-        await startQuaggaScanner();
-        return;
-      }
-
       if (selectedApi === 'native' && !('BarcodeDetector' in window)) {
-        setStatus('Native BarcodeDetector is unavailable in this browser. Choose ZXing, Quagga2, or Auto.', true);
+        setStatus('Native BarcodeDetector is unavailable in this browser. Choose ZXing or Auto.', true);
         return;
       }
 
       if ('BarcodeDetector' in window) {
         scannerMode = 'native';
-        detector = new BarcodeDetector({
-          formats: ['qr_code', 'code_128', 'code_39', 'ean_13', 'upc_a']
-        });
+        detector = new BarcodeDetector({ formats: ['qr_code'] });
 
         mediaStream = await openPreferredCameraStream();
-
         video.srcObject = mediaStream;
         await video.play();
 
         scanning = true;
         startBtn.disabled = true;
         stopBtn.disabled = false;
-        setStatus('Camera started. Using native BarcodeDetector. For fixed-focus webcams, hold code 20-35 cm away and fill most of the frame.');
-        startOcrLoop();
+        setStatus('Camera started. Using native QR scanner.');
         scanLoop();
 
         if (selectedApi === 'auto') {
@@ -1310,7 +833,7 @@ include 'lib/header.php';
               return;
             }
 
-            setStatus('Native scanner could not decode barcode. Switching to ZXing fallback...');
+            setStatus('Native scanner could not decode QR. Switching to ZXing fallback...');
             void switchToZxingFallback();
           }, 5000);
         }
@@ -1322,7 +845,7 @@ include 'lib/header.php';
         return;
       }
 
-      setStatus('Selected scanner API is unavailable. Choose ZXing, Quagga2, or Auto.', true);
+      setStatus('Selected scanner API is unavailable. Choose ZXing or Auto.', true);
     } catch (err) {
       setStatus('Unable to access camera/scanner. Check permission, HTTPS, and network for fallback library.', true);
     }
@@ -1339,7 +862,6 @@ include 'lib/header.php';
   function stopCamera() {
     scanning = false;
     clearNativeFallbackTimer();
-    stopOcrLoop();
 
     if (rafId) {
       cancelAnimationFrame(rafId);
@@ -1355,12 +877,6 @@ include 'lib/header.php';
       zxingReader.reset();
     }
 
-    if (quaggaScanInterval) {
-      clearInterval(quaggaScanInterval);
-      quaggaScanInterval = null;
-    }
-    quaggaDecodeBusy = false;
-
     if (mediaStream) {
       mediaStream.getTracks().forEach((track) => track.stop());
       mediaStream = null;
@@ -1374,22 +890,47 @@ include 'lib/header.php';
     startBtn.disabled = false;
     stopBtn.disabled = true;
     setStatus('Camera stopped.');
+  }
 
-    void teardownOcrWorker();
+  function showSuccessAnimation() {
+    try {
+      successAudio.currentTime = 0;
+      const playPromise = successAudio.play();
+      if (playPromise && typeof playPromise.catch === 'function') {
+        playPromise.catch(() => {
+          // Ignore autoplay policy rejections.
+        });
+      }
+    } catch (err) {
+      // Ignore audio errors.
+    }
+
+    if (checkmarkRoll) {
+      checkmarkRoll.textContent = scanData.userId ? `Roll: ${scanData.userId}` : '';
+    }
+
+    successOverlayActive = true;
+    checkmarkLayer.classList.add('active');
+    setTimeout(() => {
+      checkmarkLayer.classList.remove('active');
+      successOverlayActive = false;
+      if (checkmarkRoll) {
+        checkmarkRoll.textContent = '';
+      }
+    }, 3000);
   }
 
   async function submitEntry(options = {}) {
-    const fromAuto = Boolean(options.fromAuto);
-
     if (isSubmitting) {
       return;
     }
 
     if (!scanData.userId) {
-      setStatus('No barcode data detected yet.', true);
+      setStatus('No QR data detected yet.', true);
       return;
     }
 
+    const fromAuto = Boolean(options.fromAuto);
     let accessToken = tokenInput.value.trim();
 
     isSubmitting = true;
@@ -1446,7 +987,11 @@ include 'lib/header.php';
       scanData.time = now.time;
       updatePreview();
     } catch (err) {
-      setStatus(err && err.message ? err.message : 'Request failed.', true);
+      if (fromAuto) {
+        setStatus(err && err.message ? err.message : 'Auto record failed.', true);
+      } else {
+        setStatus(err && err.message ? err.message : 'Request failed.', true);
+      }
     } finally {
       isSubmitting = false;
       updateSubmitAvailability();
@@ -1529,31 +1074,15 @@ include 'lib/header.php';
     });
   }
 
-  if (ocrAssistToggle) {
-    ocrAssistToggle.addEventListener('change', () => {
-      if (ocrAssistToggle.checked) {
-        if (scanning) {
-          startOcrLoop();
-        }
-        setStatus('OCR Roll Assist enabled. Trying barcode and OCR in parallel.');
-      } else {
-        stopOcrLoop();
-        setStatus('OCR Roll Assist disabled. Barcode scanning only.');
-      }
-    });
-  }
-
   if (scannerApiSelect) {
     scannerApiSelect.addEventListener('change', () => {
       const value = scannerApiSelect.value;
-      if (value === 'quagga') {
-        setStatus('Quagga2 selected. Best for 1D barcodes like Code128/Code39/EAN/UPC.');
-      } else if (value === 'zxing') {
-        setStatus('ZXing selected. Good for QR and 1D barcodes.');
+      if (value === 'zxing') {
+        setStatus('ZXing selected. QR-only scanning mode.');
       } else if (value === 'native') {
-        setStatus('Native BarcodeDetector selected. Requires browser support.');
+        setStatus('Native BarcodeDetector selected (QR only). Requires browser support.');
       } else {
-        setStatus('Auto selected. Native first, then ZXing fallback if needed.');
+        setStatus('Auto selected. Native QR first, then ZXing fallback if needed.');
       }
     });
   }
@@ -1575,6 +1104,5 @@ include 'lib/header.php';
   setTimeout(() => {
     void autoStartCameraOnLoad();
   }, 120);
-
 })();
 </script>
